@@ -1,5 +1,11 @@
 # @backstage/plugin-scaffolder-backend-module-gerrit
 
+## 0.2.24-next.1
+
+### Patch Changes
+
+- f83a652: Made `description` parameter optional in `publish:gerrit` action.
+
 ## 0.2.24-next.0
 
 ### Patch Changes
