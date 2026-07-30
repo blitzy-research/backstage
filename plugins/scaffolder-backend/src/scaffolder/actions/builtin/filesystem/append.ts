@@ -61,9 +61,16 @@ export const createFilesystemAppendAction = () => {
       }
 
       for (const file of ctx.input.files) {
-        // The content is checked with a typeof test rather than for truthiness so
-        // that appending a legitimate empty string is not rejected.
-        if (!file.path || typeof file.content !== 'string') {
+        // Both properties are validated with typeof tests rather than for
+        // truthiness, so that every malformed entry - a null or undefined element,
+        // or a path or content that is not a string - is reported as an InputError
+        // instead of surfacing later as a native TypeError, while appending a
+        // legitimate empty string is still accepted.
+        if (
+          typeof file?.path !== 'string' ||
+          file.path.length === 0 ||
+          typeof file.content !== 'string'
+        ) {
           throw new InputError(
             'each file must have a path and content property',
           );
