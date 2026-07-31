@@ -38,8 +38,8 @@ const pathExistsOrThrow = async (filepath: string): Promise<boolean> => {
 // Strips caller derived path information out of an error before it leaves the
 // handler, naming the offending entry by its index in the files input instead.
 // Paths are step input rendered with task and environment secrets in scope, and
-// an escaping error is persisted from its raw stack, which never passes the
-// secret redaction that ctx.logger output does.
+// an escaping error is audited from its own fields, its stack and its cause
+// chain, none of which pass the secret redaction that ctx.logger output does.
 const withoutPathDetail = (err: unknown, index: number): Error => {
   // Raised below with a deliberately path free message, so it already carries
   // nothing caller derived and is returned as it is. That also keeps the
@@ -54,9 +54,14 @@ const withoutPathDetail = (err: unknown, index: number): Error => {
   const code =
     isError(err) && typeof err.code === 'string' ? ` (${err.code})` : '';
 
+  // The original error is deliberately not attached as a cause. A native
+  // filesystem failure repeats the resolved path in its own message and in
+  // enumerable fields such as path and dest, and error serialization follows the
+  // cause chain, so a raw cause would put back exactly what the replacement
+  // message leaves out. The untouched error is reported through ctx.logger at
+  // each throw site instead, where secret redaction runs first.
   return new Error(
     `Failed to append content to the file at index ${index} of the files input${code}, see the step log for the resolved path`,
-    { cause: err },
   );
 };
 

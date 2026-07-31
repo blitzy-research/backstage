@@ -15,6 +15,7 @@
  */
 
 import { resolve as resolvePath } from 'node:path';
+import { inspect } from 'node:util';
 import { createFilesystemAppendAction } from './append';
 import { createFilesystemAppendAction as createFromBarrel } from './index';
 import { createMockActionContext } from '@backstage/plugin-scaffolder-node-test-utils';
@@ -368,5 +369,85 @@ describe('fs:append', () => {
     await expect(escapingInDryRun).rejects.toThrow(
       /Relative path is not allowed to refer to a directory outside its parent/,
     );
+  });
+
+  it('should keep caller-derived paths out of the error that escapes the handler', async () => {
+    // Both routes a native filesystem failure can take are covered, because both
+    // of them rethrow through the same sanitizer. Every native error names the
+    // resolved path in its own message and in an enumerable `path` field.
+    const scenarios = [
+      {
+        // A seeded directory: the path resolves safely, then the append itself
+        // fails, which is the branch that writes to the workspace.
+        callerPath: 'a-folder',
+        code: 'EISDIR',
+        loggedMessage: `Failed to append content to file ${resolvePath(
+          workspacePath,
+          'a-folder',
+        )}:`,
+      },
+      {
+        // A child of the seeded file `unit-test-a.js`: a regular file cannot
+        // contain a directory, so the path cannot be resolved at all. The failure
+        // is a native error rather than the `NotAllowedError` of an escape, so it
+        // is sanitized rather than propagated untouched.
+        callerPath: 'unit-test-a.js/nested/child.txt',
+        code: 'ENOTDIR',
+        loggedMessage:
+          'Failed to resolve the path of file unit-test-a.js/nested/child.txt:',
+      },
+    ];
+
+    for (const { callerPath, code, loggedMessage } of scenarios) {
+      const errorLog = jest.spyOn(mockContext.logger, 'error');
+
+      const escaping: Error & { cause?: unknown } = await action
+        .handler({
+          ...mockContext,
+          input: { files: [{ path: callerPath, content: 'x' }] },
+        })
+        .then(
+          () => {
+            throw new Error(
+              `the handler was expected to reject for ${callerPath}`,
+            );
+          },
+          (err: Error & { cause?: unknown }) => err,
+        );
+
+      // The replacement message names the offending entry by its index in the
+      // files input and carries only the errno code, which is never caller
+      // derived.
+      expect(escaping.message).toEqual(
+        `Failed to append content to the file at index 0 of the files input (${code}), see the step log for the resolved path`,
+      );
+
+      // A path is step input rendered with task and environment secrets in scope,
+      // and this error is handed to the auditor, whose serialization is not
+      // subject to the redaction that ctx.logger output is. The two strings below
+      // are the shapes that serialization takes: the own enumerable fields, and a
+      // full inspection that also covers the stack and the cause chain. Neither
+      // may name a path, so the raw failure is not carried as a cause either.
+      expect(escaping.cause).toBeUndefined();
+
+      const audited = `${JSON.stringify(escaping)}${inspect(escaping, {
+        depth: Infinity,
+      })}`;
+
+      expect(audited).not.toContain(callerPath);
+      expect(audited).not.toContain(resolvePath(workspacePath, callerPath));
+      expect(audited).not.toContain(workspacePath);
+
+      // The detail is relocated rather than lost: the step logger still reports
+      // the path and the untouched failure, and its output is redacted before
+      // anything is persisted.
+      expect(errorLog).toHaveBeenCalledTimes(1);
+      expect(errorLog).toHaveBeenCalledWith(
+        loggedMessage,
+        expect.objectContaining({ code }),
+      );
+
+      errorLog.mockRestore();
+    }
   });
 });
