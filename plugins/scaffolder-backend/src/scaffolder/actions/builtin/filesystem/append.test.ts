@@ -220,6 +220,75 @@ describe('fs:append', () => {
       }),
     ).rejects.toThrow(/each file must have a path and content property/);
 
+    // A value that is present but of the wrong type is rejected as well. The
+    // three cases below pin the `typeof file.content !== 'string'` half of the
+    // guard: a number, an object that would silently stringify if it ever
+    // reached the filesystem layer, and an explicit null, which a presence only
+    // or nullability style check would let through.
+    const numberContent = action.handler({
+      ...mockContext,
+      input: { files: [{ path: 'unit-test-a.js', content: 42 }] } as any,
+    });
+
+    await expect(numberContent).rejects.toThrow(InputError);
+    await expect(numberContent).rejects.toThrow(
+      /each file must have a path and content property/,
+    );
+
+    const objectContent = action.handler({
+      ...mockContext,
+      input: {
+        files: [
+          { path: 'unit-test-a.js', content: { toString: () => ' appended' } },
+        ],
+      } as any,
+    });
+
+    await expect(objectContent).rejects.toThrow(InputError);
+    await expect(objectContent).rejects.toThrow(
+      /each file must have a path and content property/,
+    );
+
+    const nullContent = action.handler({
+      ...mockContext,
+      input: { files: [{ path: 'unit-test-a.js', content: null }] } as any,
+    });
+
+    await expect(nullContent).rejects.toThrow(InputError);
+    await expect(nullContent).rejects.toThrow(
+      /each file must have a path and content property/,
+    );
+
+    // The same holds for the `path` half of the guard: a non-string is rejected,
+    // and so is the empty string, which is a string of the wrong shape rather
+    // than a missing value. Rejecting it matters because an empty path resolves
+    // to the workspace directory itself, which is not an appendable target.
+    const numberPath = action.handler({
+      ...mockContext,
+      input: { files: [{ path: 42, content: ' appended' }] } as any,
+    });
+
+    await expect(numberPath).rejects.toThrow(InputError);
+    await expect(numberPath).rejects.toThrow(
+      /each file must have a path and content property/,
+    );
+
+    const emptyPath = action.handler({
+      ...mockContext,
+      input: { files: [{ path: '', content: ' appended' }] } as any,
+    });
+
+    await expect(emptyPath).rejects.toThrow(InputError);
+    await expect(emptyPath).rejects.toThrow(
+      /each file must have a path and content property/,
+    );
+
+    // Every entry above was rejected before it reached the filesystem, so the
+    // seeded file is still byte for byte as it was seeded.
+    expect(
+      await fs.readFile(resolvePath(workspacePath, 'unit-test-a.js'), 'utf-8'),
+    ).toEqual('hello');
+
     // Empty content is valid input, because the guard type checks `content`
     // instead of testing it for truthiness. Appending nothing is a no-op rather
     // than an error, and the file is left byte for byte as it was.
