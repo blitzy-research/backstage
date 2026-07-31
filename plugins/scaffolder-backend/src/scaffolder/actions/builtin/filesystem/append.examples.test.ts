@@ -50,8 +50,6 @@ describe('fs:append examples', () => {
     .steps[0];
   const strictAppendStep: AppendStep = yaml.parse(examples[2].example).steps[0];
 
-  // The handler is driven with the input of the parsed step, never with a
-  // hand-written copy of it.
   const appendToExisting = appendToExistingStep.input.files;
   const createMissing = createMissingStep.input.files;
   const strictAppend = strictAppendStep.input.files;

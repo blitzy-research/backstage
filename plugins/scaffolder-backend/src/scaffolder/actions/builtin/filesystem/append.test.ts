@@ -65,7 +65,6 @@ describe('fs:append', () => {
 
   type LogSpies = ReturnType<typeof spyOnLogs>;
 
-  // Every message that reached the step logger, at whichever level it was logged.
   const loggedMessages = (spies: LogSpies) =>
     [spies.info, spies.warn, spies.error].flatMap(spy =>
       spy.mock.calls.map(call => call.join(' ')),
@@ -91,8 +90,6 @@ describe('fs:append', () => {
     }
   };
 
-  // The error a rejected handler call escaped with, so that its whole shape can
-  // be asserted rather than only its class and message.
   const rejectionOf = async (
     handled: Promise<void>,
   ): Promise<Error & { cause?: unknown }> =>
@@ -230,7 +227,6 @@ describe('fs:append', () => {
     // covers the branch that emits the `error` line.
     const scenarios = [
       {
-        // A seeded directory: the path resolves safely, then the append fails.
         callerPath: `dir-${controlName}`,
         code: 'EISDIR',
       },
@@ -304,8 +300,6 @@ describe('fs:append', () => {
       /Relative path is not allowed to refer to a directory outside its parent/,
     );
 
-    // A second escape shape, which leaves the workspace by traversing back out of
-    // a directory that really exists in it rather than by a leading `..` alone.
     const nestedEscape = action.handler({
       ...mockContext,
       input: { files: [{ path: 'a-folder/../../escape.txt', content: 'x' }] },
@@ -340,8 +334,6 @@ describe('fs:append', () => {
 
     expect(await fs.readFile(insideWorkspace, 'utf-8')).toEqual('hello');
 
-    // The rejection escapes the handler and is audited outside the redaction that
-    // ctx.logger output is subject to, so it must not repeat the path it rejects.
     const rejection = await rejectionOf(absoluteInside);
 
     expect(rejection.message).not.toContain(insideWorkspace);
@@ -370,9 +362,6 @@ describe('fs:append', () => {
   });
 
   it('should throw an error when files is not an array', async () => {
-    // Each value asserts the error class as well as the message, so a guard that
-    // stopped raising `InputError` and threw a plain `Error` with the same text
-    // would fail here rather than pass unnoticed.
     const undefinedFiles = action.handler({
       ...mockContext,
       input: { files: undefined } as any,

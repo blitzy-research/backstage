@@ -93,12 +93,9 @@ const withoutPathDetail = (err: unknown, index: number): Error => {
   );
 };
 
-// The rejection that resolveSafeChildPath raises for a path which leaves the
-// workspace, which is the one failure that must reach the caller exactly as it
-// was raised. Its class is recognised by name rather than with `instanceof`
-// because this action's imports mirror its siblings' five declarations, and
-// because `name` is the discriminator every error type in `@backstage/errors`
-// declares and carries through serialization.
+// Identifies the fixed NotAllowedError that resolveSafeChildPath raises for a
+// path which leaves the workspace, the one failure that must reach the caller
+// exactly as it was raised.
 const isWorkspaceEscape = (err: unknown): boolean =>
   err instanceof Error && err.name === 'NotAllowedError';
 
