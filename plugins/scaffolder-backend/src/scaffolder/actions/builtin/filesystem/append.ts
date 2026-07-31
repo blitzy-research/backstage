@@ -20,18 +20,9 @@ import { resolveSafeChildPath } from '@backstage/backend-plugin-api';
 import fs from 'fs-extra';
 import { examples } from './append.examples';
 
-/**
- * Checks whether the target already exists, resolving to false only when it is
- * genuinely absent and rethrowing every other failure with its original cause.
- *
- * fs.pathExists is deliberately not used here. It is an access check whose
- * rejection is swallowed, so it reports every failure as a missing target,
- * including a real one such as a parent directory that cannot be read or a
- * parent path segment that is a file rather than a directory. That would let a
- * genuine filesystem error be skipped by the dry run branch below, or be
- * reported as a file that does not exist yet, instead of being logged in full
- * and rethrown.
- */
+// Resolves to false only for a genuinely absent target, rethrowing every other
+// failure with its cause. fs.pathExists is not used: it suppresses every access
+// error, which would misreport a real failure as a missing target.
 const pathExistsOrThrow = async (filepath: string): Promise<boolean> => {
   try {
     await fs.access(filepath);
@@ -44,22 +35,11 @@ const pathExistsOrThrow = async (filepath: string): Promise<boolean> => {
   }
 };
 
-/**
- * Strips caller derived path information out of an error before it leaves the
- * handler, identifying the offending entry by its position in the files input
- * instead.
- *
- * A path is step input, and step input is rendered with the task and the
- * configured environment secrets in scope, so a rendered secret can end up
- * inside a path. The two channels that carry a failure out of an action redact
- * very differently: anything written through ctx.logger passes the step
- * logger's secret redaction before it is persisted, whereas an error that
- * escapes the handler is persisted to the task event stream from its raw stack,
- * which never reaches that redaction. No error may therefore carry a path out
- * of this handler. The resolved path is reported through ctx.logger instead,
- * and the error that caused the failure is kept as the cause, so that neither
- * the path nor the original errno is lost to whoever has to diagnose the task.
- */
+// Strips caller derived path information out of an error before it leaves the
+// handler, naming the offending entry by its index in the files input instead.
+// Paths are step input rendered with task and environment secrets in scope, and
+// an escaping error is persisted from its raw stack, which never passes the
+// secret redaction that ctx.logger output does.
 const withoutPathDetail = (err: unknown, index: number): Error => {
   // Raised below with a deliberately path free message, so it already carries
   // nothing caller derived and is returned as it is. That also keeps the
@@ -123,11 +103,8 @@ export const createFilesystemAppendAction = () => {
       // The index is carried alongside each entry so that a failure can name the
       // entry it belongs to without naming its path, which is caller derived.
       for (const [index, file] of ctx.input.files.entries()) {
-        // Both properties are validated with typeof tests rather than for
-        // truthiness, so that every malformed entry - a null or undefined element,
-        // or a path or content that is not a string - is reported as an InputError
-        // instead of surfacing later as a native TypeError, while appending a
-        // legitimate empty string is still accepted.
+        // Type checks rather than truthiness, so a malformed entry raises an
+        // InputError, not a downstream TypeError, and empty content is valid.
         if (
           typeof file?.path !== 'string' ||
           file.path.length === 0 ||
@@ -140,14 +117,9 @@ export const createFilesystemAppendAction = () => {
 
         // Resolved before the try block below, so the NotAllowedError raised for a
         // path that points outside of the workspace always propagates untouched,
-        // and is never downgraded or suppressed by the dry run handling.
-        //
-        // The helper resolves the real path of the target to do that check, so it
-        // can also surface a native failure - an ENOTDIR when a parent segment is
-        // a file rather than a directory, for instance. That one quotes the path
-        // it failed on, so it is stripped like every other escaping error, while
-        // the NotAllowedError, whose message names no path, is re-raised exactly
-        // as it was thrown.
+        // and is never downgraded or suppressed by the dry run handling. Its
+        // message names no path; any other failure raised there is stripped
+        // like every other escaping error.
         let filepath: string;
         try {
           filepath = resolveSafeChildPath(ctx.workspacePath, file.path);
@@ -170,7 +142,6 @@ export const createFilesystemAppendAction = () => {
 
         try {
           if (await pathExistsOrThrow(filepath)) {
-            // Appending preserves every byte that is already in the file.
             await fs.appendFile(filepath, file.content);
           } else if (createIfMissing) {
             // Writes the content as the entire body of the new file and creates any
@@ -195,9 +166,9 @@ export const createFilesystemAppendAction = () => {
 
           ctx.logger.info(`Content appended to file ${filepath} successfully`);
         } catch (err) {
-          // ctx.logger is the step logger, whose secret redaction runs before
-          // anything is persisted, so this is the only place the resolved path is
-          // reported. The rethrown error is stripped of it.
+          // On failure the resolved path is reported through ctx.logger, whose
+          // secret redaction runs before anything is persisted; the rethrown
+          // error is stripped of it.
           ctx.logger.error(
             `Failed to append content to file ${filepath}:`,
             err,
