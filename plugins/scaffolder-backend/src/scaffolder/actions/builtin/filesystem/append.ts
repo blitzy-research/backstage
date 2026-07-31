@@ -15,10 +15,34 @@
  */
 
 import { createTemplateAction } from '@backstage/plugin-scaffolder-node';
-import { InputError } from '@backstage/errors';
+import { InputError, isError } from '@backstage/errors';
 import { resolveSafeChildPath } from '@backstage/backend-plugin-api';
 import fs from 'fs-extra';
 import { examples } from './append.examples';
+
+/**
+ * Checks whether the target already exists, resolving to false only when it is
+ * genuinely absent and rethrowing every other failure with its original cause.
+ *
+ * fs.pathExists is deliberately not used here. It is an access check whose
+ * rejection is swallowed, so it reports every failure as a missing target,
+ * including a real one such as a parent directory that cannot be read or a
+ * parent path segment that is a file rather than a directory. That would let a
+ * genuine filesystem error be skipped by the dry run branch below, or be
+ * reported as a file that does not exist yet, instead of being logged and
+ * rethrown untouched.
+ */
+const pathExistsOrThrow = async (filepath: string): Promise<boolean> => {
+  try {
+    await fs.access(filepath);
+    return true;
+  } catch (err) {
+    if (isError(err) && err.code === 'ENOENT') {
+      return false;
+    }
+    throw err;
+  }
+};
 
 /**
  * Creates a new action that enables appending content to files in the workspace.
@@ -88,7 +112,7 @@ export const createFilesystemAppendAction = () => {
         const createIfMissing = file.createIfMissing ?? true;
 
         try {
-          if (await fs.pathExists(filepath)) {
+          if (await pathExistsOrThrow(filepath)) {
             // Appending preserves every byte that is already in the file.
             await fs.appendFile(filepath, file.content);
           } else if (createIfMissing) {
