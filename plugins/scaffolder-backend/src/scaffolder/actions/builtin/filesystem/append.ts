@@ -15,7 +15,7 @@
  */
 
 import { createTemplateAction } from '@backstage/plugin-scaffolder-node';
-import { InputError, isError } from '@backstage/errors';
+import { InputError, isError, NotAllowedError } from '@backstage/errors';
 import { resolveSafeChildPath } from '@backstage/backend-plugin-api';
 import fs from 'fs-extra';
 import { examples } from './append.examples';
@@ -29,8 +29,8 @@ import { examples } from './append.examples';
  * including a real one such as a parent directory that cannot be read or a
  * parent path segment that is a file rather than a directory. That would let a
  * genuine filesystem error be skipped by the dry run branch below, or be
- * reported as a file that does not exist yet, instead of being logged and
- * rethrown untouched.
+ * reported as a file that does not exist yet, instead of being logged in full
+ * and rethrown.
  */
 const pathExistsOrThrow = async (filepath: string): Promise<boolean> => {
   try {
@@ -42,6 +42,42 @@ const pathExistsOrThrow = async (filepath: string): Promise<boolean> => {
     }
     throw err;
   }
+};
+
+/**
+ * Strips caller derived path information out of an error before it leaves the
+ * handler, identifying the offending entry by its position in the files input
+ * instead.
+ *
+ * A path is step input, and step input is rendered with the task and the
+ * configured environment secrets in scope, so a rendered secret can end up
+ * inside a path. The two channels that carry a failure out of an action redact
+ * very differently: anything written through ctx.logger passes the step
+ * logger's secret redaction before it is persisted, whereas an error that
+ * escapes the handler is persisted to the task event stream from its raw stack,
+ * which never reaches that redaction. No error may therefore carry a path out
+ * of this handler. The resolved path is reported through ctx.logger instead,
+ * and the error that caused the failure is kept as the cause, so that neither
+ * the path nor the original errno is lost to whoever has to diagnose the task.
+ */
+const withoutPathDetail = (err: unknown, index: number): Error => {
+  // Raised below with a deliberately path free message, so it already carries
+  // nothing caller derived and is returned as it is. That also keeps the
+  // documented InputError contract for a file that an author required to exist.
+  if (err instanceof InputError) {
+    return err;
+  }
+
+  // A filesystem error code such as ENOTDIR or EACCES is the single most useful
+  // part of a native failure and is never caller derived, so it is the one
+  // detail that is carried over into the replacement message.
+  const code =
+    isError(err) && typeof err.code === 'string' ? ` (${err.code})` : '';
+
+  return new Error(
+    `Failed to append content to the file at index ${index} of the files input${code}, see the step log for the resolved path`,
+    { cause: err },
+  );
 };
 
 /**
@@ -84,7 +120,9 @@ export const createFilesystemAppendAction = () => {
         throw new InputError('files must be an Array');
       }
 
-      for (const file of ctx.input.files) {
+      // The index is carried alongside each entry so that a failure can name the
+      // entry it belongs to without naming its path, which is caller derived.
+      for (const [index, file] of ctx.input.files.entries()) {
         // Both properties are validated with typeof tests rather than for
         // truthiness, so that every malformed entry - a null or undefined element,
         // or a path or content that is not a string - is reported as an InputError
@@ -103,7 +141,26 @@ export const createFilesystemAppendAction = () => {
         // Resolved before the try block below, so the NotAllowedError raised for a
         // path that points outside of the workspace always propagates untouched,
         // and is never downgraded or suppressed by the dry run handling.
-        const filepath = resolveSafeChildPath(ctx.workspacePath, file.path);
+        //
+        // The helper resolves the real path of the target to do that check, so it
+        // can also surface a native failure - an ENOTDIR when a parent segment is
+        // a file rather than a directory, for instance. That one quotes the path
+        // it failed on, so it is stripped like every other escaping error, while
+        // the NotAllowedError, whose message names no path, is re-raised exactly
+        // as it was thrown.
+        let filepath: string;
+        try {
+          filepath = resolveSafeChildPath(ctx.workspacePath, file.path);
+        } catch (err) {
+          if (err instanceof NotAllowedError) {
+            throw err;
+          }
+          ctx.logger.error(
+            `Failed to resolve the path of file ${file.path}:`,
+            err,
+          );
+          throw withoutPathDetail(err, index);
+        }
 
         // The fallback is applied here rather than in the schema above, because the
         // returned handler is not wrapped in schema validation. The schema is only
@@ -128,18 +185,24 @@ export const createFilesystemAppendAction = () => {
             );
             continue;
           } else {
+            // The resolved path is deliberately left out of this message because
+            // the error escapes the handler, see withoutPathDetail above. The
+            // catch below reports the path through ctx.logger instead.
             throw new InputError(
-              `Cannot append to file ${filepath} because it does not exist and createIfMissing is false`,
+              `Cannot append to the file at index ${index} of the files input because it does not exist and createIfMissing is false`,
             );
           }
 
           ctx.logger.info(`Content appended to file ${filepath} successfully`);
         } catch (err) {
+          // ctx.logger is the step logger, whose secret redaction runs before
+          // anything is persisted, so this is the only place the resolved path is
+          // reported. The rethrown error is stripped of it.
           ctx.logger.error(
             `Failed to append content to file ${filepath}:`,
             err,
           );
-          throw err;
+          throw withoutPathDetail(err, index);
         }
       }
     },
