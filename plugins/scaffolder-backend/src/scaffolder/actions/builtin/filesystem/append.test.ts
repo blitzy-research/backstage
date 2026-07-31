@@ -22,12 +22,6 @@ import { InputError } from '@backstage/errors';
 import fs from 'fs-extra';
 import { createMockDirectory } from '@backstage/backend-test-utils';
 
-/**
- * The shape of a single entry of the action's `files` input.
- *
- * It is declared locally because the action derives its input type from its zod
- * schema and therefore exports no named type for an individual entry.
- */
 type AppendFile = {
   path: string;
   content: string;
@@ -40,10 +34,8 @@ describe('fs:append', () => {
   const mockDir = createMockDirectory();
   const workspacePath = resolvePath(mockDir.path, 'workspace');
 
-  // The input schema chains `.nonempty()`, so the handler's input type is the
-  // non-empty tuple `[AppendFile, ...AppendFile[]]` rather than a plain array.
-  // Annotating the shared input as that tuple keeps every handler call
-  // assignable without resorting to a cast.
+  // `.nonempty()` infers a non-empty tuple, so keep the shared mock input
+  // tuple-typed.
   const mockInputFiles: [AppendFile, ...AppendFile[]] = [
     {
       path: 'unit-test-a.js',
@@ -76,8 +68,6 @@ describe('fs:append', () => {
   });
 
   it('should be exported from the filesystem actions barrel', () => {
-    // Proves the re-export that carries the action to the package entry point,
-    // and therefore into the backend's default filesystem action set.
     expect(createFromBarrel().id).toEqual('fs:append');
   });
 
@@ -94,9 +84,6 @@ describe('fs:append', () => {
 
     const afterContent = await fs.readFile(filePath, 'utf-8');
 
-    // The full concatenation is asserted rather than a substring match, so that
-    // the original bytes are proven to be preserved and the appended bytes are
-    // proven to be at the end.
     expect(afterContent).toEqual(`${beforeContent} appended`);
   });
 
@@ -220,11 +207,6 @@ describe('fs:append', () => {
       }),
     ).rejects.toThrow(/each file must have a path and content property/);
 
-    // A value that is present but of the wrong type is rejected as well. The
-    // three cases below pin the `typeof file.content !== 'string'` half of the
-    // guard: a number, an object that would silently stringify if it ever
-    // reached the filesystem layer, and an explicit null, which a presence only
-    // or nullability style check would let through.
     const numberContent = action.handler({
       ...mockContext,
       input: { files: [{ path: 'unit-test-a.js', content: 42 }] } as any,
@@ -259,10 +241,6 @@ describe('fs:append', () => {
       /each file must have a path and content property/,
     );
 
-    // The same holds for the `path` half of the guard: a non-string is rejected,
-    // and so is the empty string, which is a string of the wrong shape rather
-    // than a missing value. Rejecting it matters because an empty path resolves
-    // to the workspace directory itself, which is not an appendable target.
     const numberPath = action.handler({
       ...mockContext,
       input: { files: [{ path: 42, content: ' appended' }] } as any,
@@ -273,6 +251,8 @@ describe('fs:append', () => {
       /each file must have a path and content property/,
     );
 
+    // An empty path resolves to the workspace directory, which must not be
+    // accepted as a file target.
     const emptyPath = action.handler({
       ...mockContext,
       input: { files: [{ path: '', content: ' appended' }] } as any,
@@ -283,15 +263,10 @@ describe('fs:append', () => {
       /each file must have a path and content property/,
     );
 
-    // Every entry above was rejected before it reached the filesystem, so the
-    // seeded file is still byte for byte as it was seeded.
     expect(
       await fs.readFile(resolvePath(workspacePath, 'unit-test-a.js'), 'utf-8'),
     ).toEqual('hello');
 
-    // Empty content is valid input, because the guard type checks `content`
-    // instead of testing it for truthiness. Appending nothing is a no-op rather
-    // than an error, and the file is left byte for byte as it was.
     await expect(
       action.handler({
         ...mockContext,
