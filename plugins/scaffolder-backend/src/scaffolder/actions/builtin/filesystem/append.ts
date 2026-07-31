@@ -15,40 +15,48 @@
  */
 
 import { createTemplateAction } from '@backstage/plugin-scaffolder-node';
-import { InputError, isError, NotAllowedError } from '@backstage/errors';
-import {
-  LoggerService,
-  resolveSafeChildPath,
-} from '@backstage/backend-plugin-api';
-import { isAbsolute } from 'node:path';
+import { InputError } from '@backstage/errors';
+import { resolveSafeChildPath } from '@backstage/backend-plugin-api';
 import fs from 'fs-extra';
 import { examples } from './append.examples';
-
-// Resolves to false only for a genuinely absent target, rethrowing every other
-// failure with its cause. fs.pathExists is not used: it suppresses every access
-// error, which would misreport a real failure as a missing target.
-const pathExistsOrThrow = async (filepath: string): Promise<boolean> => {
-  try {
-    await fs.access(filepath);
-    return true;
-  } catch (err) {
-    if (isError(err) && err.code === 'ENOENT') {
-      return false;
-    }
-    throw err;
-  }
-};
 
 // An errno such as ENOTDIR or EACCES is the single most useful part of a native
 // filesystem failure, and unlike the rest of the failure it is never caller
 // derived. Only a value matching this shape is carried into a message, which
 // keeps the allow list narrow enough that no control character, path fragment or
 // other unexpected text can reach a log record or an escaping error through it.
+const ERRNO_CODE_PATTERN = /^[A-Z][A-Z0-9_]*$/;
+
+// `code` is not declared on Error, and what is caught here is unknown rather
+// than an Error to begin with, so the property is read defensively instead of
+// through a narrowing helper.
 const asErrnoCode = (err: unknown): string | undefined => {
-  if (!isError(err) || typeof err.code !== 'string') {
-    return undefined;
+  const code = (err as { code?: unknown } | null | undefined)?.code;
+
+  return typeof code === 'string' && ERRNO_CODE_PATTERN.test(code)
+    ? code
+    : undefined;
+};
+
+// A leading separator, and on Windows a drive rooted prefix such as `C:\`, is
+// what makes a path absolute. Both forms are recognised on every platform, so
+// that the workspace-relative input contract below is enforced identically
+// wherever the backend runs rather than only where it happens to be running.
+const ABSOLUTE_PATH_PATTERN = /^(?:[/\\]|[A-Za-z]:[/\\])/;
+
+// Resolves to false only for a genuinely absent target, rethrowing every other
+// failure. fs.pathExists is not used: it suppresses every access error, which
+// would misreport a real failure as a missing target.
+const pathExistsOrThrow = async (filepath: string): Promise<boolean> => {
+  try {
+    await fs.access(filepath);
+    return true;
+  } catch (err) {
+    if (asErrnoCode(err) === 'ENOENT') {
+      return false;
+    }
+    throw err;
   }
-  return /^[A-Z][A-Z0-9_]*$/.test(err.code) ? err.code : undefined;
 };
 
 // Builds the failure that leaves the handler, and the single message that is
@@ -85,18 +93,14 @@ const withoutPathDetail = (err: unknown, index: number): Error => {
   );
 };
 
-// Reports a failure through the step logger and returns the error to throw for
-// it. Both carry exactly the same path free text, so the log record cannot
-// disclose a detail that the escaping error withholds, or the other way around.
-const logFailure = (
-  logger: LoggerService,
-  err: unknown,
-  index: number,
-): Error => {
-  const failure = withoutPathDetail(err, index);
-  logger.error(failure.message);
-  return failure;
-};
+// The rejection that resolveSafeChildPath raises for a path which leaves the
+// workspace, which is the one failure that must reach the caller exactly as it
+// was raised. Its class is recognised by name rather than with `instanceof`
+// because this action's imports mirror its siblings' five declarations, and
+// because `name` is the discriminator every error type in `@backstage/errors`
+// declares and carries through serialization.
+const isWorkspaceEscape = (err: unknown): boolean =>
+  err instanceof Error && err.name === 'NotAllowedError';
 
 /**
  * Creates a new action that enables appending content to files in the workspace.
@@ -162,25 +166,10 @@ export const createFilesystemAppendAction = () => {
         // before the resolution below so that no absolute path reaches the
         // filesystem, and its message names the entry by its index rather than by
         // its path, which is caller derived.
-        if (isAbsolute(file.path)) {
+        if (ABSOLUTE_PATH_PATTERN.test(file.path)) {
           throw new InputError(
             `the path of the file at index ${index} of the files input must be workspace-relative`,
           );
-        }
-
-        // Resolved before the try block below, so the NotAllowedError raised for a
-        // path that points outside of the workspace always propagates untouched,
-        // and is never downgraded or suppressed by the dry run handling. Its
-        // message names no path; any other failure raised there is stripped
-        // like every other escaping error.
-        let filepath: string;
-        try {
-          filepath = resolveSafeChildPath(ctx.workspacePath, file.path);
-        } catch (err) {
-          if (err instanceof NotAllowedError) {
-            throw err;
-          }
-          throw logFailure(ctx.logger, err, index);
         }
 
         // The fallback is applied here rather than in the schema above, because the
@@ -190,6 +179,12 @@ export const createFilesystemAppendAction = () => {
         const createIfMissing = file.createIfMissing ?? true;
 
         try {
+          // Resolving the path is inside this try only so that a native failure
+          // raised while doing it is stripped like any other, never so that the
+          // workspace escape it rejects can be downgraded or suppressed: that
+          // rejection is rethrown untouched below, including during a dry run.
+          const filepath = resolveSafeChildPath(ctx.workspacePath, file.path);
+
           if (await pathExistsOrThrow(filepath)) {
             await fs.appendFile(filepath, file.content);
           } else if (createIfMissing) {
@@ -216,7 +211,24 @@ export const createFilesystemAppendAction = () => {
             `Content appended to the file at index ${index} of the files input successfully`,
           );
         } catch (err) {
-          throw logFailure(ctx.logger, err, index);
+          // Nothing about a workspace escape is caller derived: its message is a
+          // fixed sentence naming no path, and it is the documented outcome for a
+          // path that leaves the workspace, so it is reraised as it was raised.
+          if (isWorkspaceEscape(err)) {
+            throw err;
+          }
+
+          // Everything else may name the resolved path, either because the
+          // resolver follows symbolic links to decide whether the target really
+          // is inside the workspace or because a write failed, so it is replaced.
+          const failure = withoutPathDetail(err, index);
+
+          // Reported through the step logger with exactly the same path free text
+          // as the error that escapes, so the log record cannot disclose a detail
+          // that the escaping error withholds, or the other way around.
+          ctx.logger.error(failure.message);
+
+          throw failure;
         }
       }
     },

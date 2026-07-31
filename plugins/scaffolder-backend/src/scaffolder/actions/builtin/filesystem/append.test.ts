@@ -35,6 +35,13 @@ describe('fs:append', () => {
   const mockDir = createMockDirectory();
   const workspacePath = resolvePath(mockDir.path, 'workspace');
 
+  // A file name may legitimately contain carriage returns, line feeds and
+  // terminal escape sequences, none of which the task logger's secret redaction
+  // neutralizes. Interpolating one into a log message would let a template forge
+  // multiline log records or rewrite terminal output, so the cases below drive
+  // every branch that logs with a name built from this fragment.
+  const controlName = 'control\r\n\u001b[31m\u0007name.txt';
+
   // `.nonempty()` infers a non-empty tuple, so keep the shared mock input
   // tuple-typed.
   const mockInputFiles: [AppendFile, ...AppendFile[]] = [
@@ -50,6 +57,52 @@ describe('fs:append', () => {
     workspacePath,
   });
 
+  const spyOnLogs = () => ({
+    info: jest.spyOn(mockContext.logger, 'info'),
+    warn: jest.spyOn(mockContext.logger, 'warn'),
+    error: jest.spyOn(mockContext.logger, 'error'),
+  });
+
+  type LogSpies = ReturnType<typeof spyOnLogs>;
+
+  // Every message that reached the step logger, at whichever level it was logged.
+  const loggedMessages = (spies: LogSpies) =>
+    [spies.info, spies.warn, spies.error].flatMap(spy =>
+      spy.mock.calls.map(call => call.join(' ')),
+    );
+
+  const expectLogsSafe = (spies: LogSpies, callerPath: string) => {
+    const messages = loggedMessages(spies);
+
+    expect(messages).not.toEqual([]);
+
+    for (const message of messages) {
+      // No C0 or C1 control character, so a single log record cannot be split
+      // into several or carry a terminal escape sequence.
+      // eslint-disable-next-line no-control-regex
+      expect(message).not.toMatch(/[\u0000-\u001f\u007f-\u009f]/);
+
+      // Neither the caller's path nor anything it resolves to is disclosed, so a
+      // rendered secret cannot reach a log record through a file name and the
+      // layout of the workspace stays private.
+      expect(message).not.toContain(controlName);
+      expect(message).not.toContain(callerPath);
+      expect(message).not.toContain(workspacePath);
+    }
+  };
+
+  // The error a rejected handler call escaped with, so that its whole shape can
+  // be asserted rather than only its class and message.
+  const rejectionOf = async (
+    handled: Promise<void>,
+  ): Promise<Error & { cause?: unknown }> =>
+    handled.then(
+      () => {
+        throw new Error('the handler was expected to reject');
+      },
+      (err: Error & { cause?: unknown }) => err,
+    );
+
   beforeEach(() => {
     jest.restoreAllMocks();
 
@@ -58,6 +111,10 @@ describe('fs:append', () => {
         'unit-test-a.js': 'hello',
         'unit-test-b.js': 'world',
         'a-folder': {
+          'file.md': 'content',
+        },
+        [`file-${controlName}`]: 'seeded',
+        [`dir-${controlName}`]: {
           'file.md': 'content',
         },
       },
@@ -86,6 +143,27 @@ describe('fs:append', () => {
     const afterContent = await fs.readFile(filePath, 'utf-8');
 
     expect(afterContent).toEqual(`${beforeContent} appended`);
+
+    // The same append, to a seeded file whose name carries the control characters
+    // a POSIX file name may legitimately contain. This is the branch that emits
+    // the `info` line, so it also proves that line names the entry by its index
+    // rather than by its path.
+    const controlPath = `file-${controlName}`;
+    const controlFilePath = resolvePath(workspacePath, controlPath);
+    const spies = spyOnLogs();
+
+    await action.handler({
+      ...mockContext,
+      input: { files: [{ path: controlPath, content: ' appended' }] },
+    });
+
+    expect(await fs.readFile(controlFilePath, 'utf-8')).toEqual(
+      'seeded appended',
+    );
+    expect(spies.info).toHaveBeenCalledWith(
+      'Content appended to the file at index 0 of the files input successfully',
+    );
+    expectLogsSafe(spies, controlPath);
   });
 
   it('should create the file and any missing parent directories when it does not exist', async () => {
@@ -134,6 +212,81 @@ describe('fs:append', () => {
     );
 
     expect(fs.existsSync(target)).toBe(false);
+
+    // This rejection escapes the handler and is audited outside the redaction
+    // that ctx.logger output is subject to, so it names the entry by its index
+    // instead of repeating the path an author required to exist.
+    const strictRejection = await rejectionOf(rejected);
+
+    expect(strictRejection.message).not.toContain('does-not-exist.txt');
+    expect(strictRejection.message).not.toContain(workspacePath);
+
+    // The two other routes a failure takes out of the handler, both of them
+    // rethrown through the same sanitizer: a native error raised by the append
+    // itself, and one raised while the resolver follows symbolic links to check
+    // that the target really is inside the workspace. Every native filesystem
+    // error names the resolved path in its own message and in an enumerable
+    // `path` field, and the names below carry control characters, so this also
+    // covers the branch that emits the `error` line.
+    const scenarios = [
+      {
+        // A seeded directory: the path resolves safely, then the append fails.
+        callerPath: `dir-${controlName}`,
+        code: 'EISDIR',
+      },
+      {
+        // A child of a seeded file: a regular file cannot contain a directory, so
+        // the resolver fails before any write is attempted. The failure is a
+        // native error rather than the `NotAllowedError` of an escape, so it is
+        // sanitized rather than propagated untouched.
+        callerPath: `file-${controlName}/nested/child.txt`,
+        code: 'ENOTDIR',
+      },
+    ];
+
+    for (const { callerPath, code } of scenarios) {
+      const spies = spyOnLogs();
+
+      const escaping = await rejectionOf(
+        action.handler({
+          ...mockContext,
+          input: { files: [{ path: callerPath, content: 'x' }] },
+        }),
+      );
+
+      // The replacement message names the offending entry by its index in the
+      // files input and carries only the errno code, which is never caller
+      // derived.
+      expect(escaping.message).toEqual(
+        `Failed to append content to the file at index 0 of the files input (${code})`,
+      );
+
+      // A path is step input rendered with task and environment secrets in scope,
+      // and this error is handed to the auditor, whose serialization is not
+      // subject to the redaction that ctx.logger output is. The two strings below
+      // are the shapes that serialization takes: the own enumerable fields, and a
+      // full inspection that also covers the stack and the cause chain. Neither
+      // may name a path, so the raw failure is not carried as a cause either.
+      expect(escaping.cause).toBeUndefined();
+
+      const audited = `${JSON.stringify(escaping)}${inspect(escaping, {
+        depth: Infinity,
+      })}`;
+
+      expect(audited).not.toContain(callerPath);
+      expect(audited).not.toContain(resolvePath(workspacePath, callerPath));
+      expect(audited).not.toContain(workspacePath);
+
+      // The failure is reported exactly once, with the same path-free text as the
+      // escaping error and with no second argument: handing the native error to
+      // the logger would reinstate the resolved path through its message and its
+      // enumerable `path` field.
+      expect(spies.error).toHaveBeenCalledTimes(1);
+      expect(spies.error).toHaveBeenCalledWith(escaping.message);
+      expectLogsSafe(spies, callerPath);
+
+      jest.restoreAllMocks();
+    }
   });
 
   it('should throw when the path is not relative to the workspace', async () => {
@@ -153,9 +306,6 @@ describe('fs:append', () => {
 
     // A second escape shape, which leaves the workspace by traversing back out of
     // a directory that really exists in it rather than by a leading `..` alone.
-    // Absolute paths are not asserted here: they are rejected by the handler's own
-    // workspace-relative guard before they ever reach the resolver, which the
-    // case below covers.
     const nestedEscape = action.handler({
       ...mockContext,
       input: { files: [{ path: 'a-folder/../../escape.txt', content: 'x' }] },
@@ -165,14 +315,14 @@ describe('fs:append', () => {
     await expect(nestedEscape).rejects.toThrow(
       /Relative path is not allowed to refer to a directory outside its parent/,
     );
-  });
 
-  it('should throw when the path is absolute rather than workspace-relative', async () => {
-    // `resolveSafeChildPath` accepts an absolute path whenever it resolves inside
-    // the base directory, so an absolute path that points at a real file in the
-    // workspace is exactly the input the handler's own guard has to reject. A
-    // seeded file is used so that the assertions below can also prove that
-    // nothing was appended to it.
+    // An absolute path is not workspace-relative either, and it is rejected by the
+    // handler's own guard before it ever reaches the resolver. That guard is what
+    // the rest of this case covers, because `resolveSafeChildPath` on its own
+    // accepts an absolute path whenever it resolves inside the base directory, so
+    // an absolute path pointing at a real file in the workspace is exactly the
+    // input the guard has to reject. A seeded file is used so that the assertions
+    // below can also prove that nothing was appended to it.
     const insideWorkspace = resolvePath(workspacePath, 'unit-test-a.js');
 
     expect(isAbsolute(insideWorkspace)).toBe(true);
@@ -192,19 +342,21 @@ describe('fs:append', () => {
 
     // The rejection escapes the handler and is audited outside the redaction that
     // ctx.logger output is subject to, so it must not repeat the path it rejects.
-    const rejection: Error = await absoluteInside.then(
-      () => {
-        throw new Error('the handler was expected to reject');
-      },
-      (err: Error) => err,
-    );
+    const rejection = await rejectionOf(absoluteInside);
 
     expect(rejection.message).not.toContain(insideWorkspace);
     expect(rejection.message).not.toContain(workspacePath);
 
     // An absolute path that points outside the workspace is rejected by the same
-    // guard, so it never reaches the resolver either.
-    for (const path of ['/foo/../../../index.js', '/etc/passwd']) {
+    // guard, so it never reaches the resolver either. The Windows forms of an
+    // absolute path are rejected on every platform, so a template cannot rely on
+    // the operating system the backend happens to run on to smuggle one through.
+    for (const path of [
+      '/foo/../../../index.js',
+      '/etc/passwd',
+      'C:\\Windows\\system32\\drivers\\etc\\hosts',
+      '\\\\server\\share\\x',
+    ]) {
       const absoluteOutside = action.handler({
         ...mockContext,
         input: { files: [{ path, content: 'x' }] },
@@ -378,20 +530,24 @@ describe('fs:append', () => {
     const target = resolvePath(workspacePath, 'missing-in-dry-run.txt');
     const laterTarget = resolvePath(workspacePath, 'unit-test-b.js');
 
-    // `ctx.isDryRun` is only ever true for an action that advertises dry run
-    // support, so the leniency asserted below is unreachable without this flag.
+    // The dry run flag on the action context is only ever true for an action
+    // that advertises support for dry runs, so the leniency asserted below is
+    // unreachable without it.
     expect(action.supportsDryRun).toBe(true);
+
+    // The flag is spread onto the context rather than passed to
+    // `createMockActionContext`, which propagates only a fixed set of options
+    // and would silently drop it, leaving this case vacuous. It is spread once
+    // here and reused by every invocation below, so that each of them is driven
+    // by the same dry run context.
+    const dryRunContext = { ...mockContext, isDryRun: true };
 
     expect(fs.existsSync(target)).toBe(false);
     expect(await fs.readFile(laterTarget, 'utf-8')).toEqual('world');
 
-    // The dry run flag is spread onto the context rather than passed to
-    // `createMockActionContext`, which propagates only a fixed set of options
-    // and would silently drop it, leaving this case vacuous.
     await expect(
       action.handler({
-        ...mockContext,
-        isDryRun: true,
+        ...dryRunContext,
         input: {
           files: [
             {
@@ -415,8 +571,7 @@ describe('fs:append', () => {
     // missing target, and an escaping path still fails with the untouched
     // `NotAllowedError` from `resolveSafeChildPath`.
     const escapingInDryRun = action.handler({
-      ...mockContext,
-      isDryRun: true,
+      ...dryRunContext,
       input: { files: [{ path: '../../etc/x', content: 'x' }] },
     });
 
@@ -424,192 +579,26 @@ describe('fs:append', () => {
     await expect(escapingInDryRun).rejects.toThrow(
       /Relative path is not allowed to refer to a directory outside its parent/,
     );
-  });
 
-  it('should keep caller-derived paths out of the error that escapes the handler', async () => {
-    // Both routes a native filesystem failure can take are covered, because both
-    // of them rethrow through the same sanitizer. Every native error names the
-    // resolved path in its own message and in an enumerable `path` field.
-    const scenarios = [
-      {
-        // A seeded directory: the path resolves safely, then the append itself
-        // fails, which is the branch that writes to the workspace.
-        callerPath: 'a-folder',
-        code: 'EISDIR',
-      },
-      {
-        // A child of the seeded file `unit-test-a.js`: a regular file cannot
-        // contain a directory, so the path cannot be resolved at all. The failure
-        // is a native error rather than the `NotAllowedError` of an escape, so it
-        // is sanitized rather than propagated untouched.
-        callerPath: 'unit-test-a.js/nested/child.txt',
-        code: 'ENOTDIR',
-      },
-    ];
-
-    for (const { callerPath, code } of scenarios) {
-      const errorLog = jest.spyOn(mockContext.logger, 'error');
-
-      const escaping: Error & { cause?: unknown } = await action
-        .handler({
-          ...mockContext,
-          input: { files: [{ path: callerPath, content: 'x' }] },
-        })
-        .then(
-          () => {
-            throw new Error(
-              `the handler was expected to reject for ${callerPath}`,
-            );
-          },
-          (err: Error & { cause?: unknown }) => err,
-        );
-
-      // The replacement message names the offending entry by its index in the
-      // files input and carries only the errno code, which is never caller
-      // derived.
-      expect(escaping.message).toEqual(
-        `Failed to append content to the file at index 0 of the files input (${code})`,
-      );
-
-      // A path is step input rendered with task and environment secrets in scope,
-      // and this error is handed to the auditor, whose serialization is not
-      // subject to the redaction that ctx.logger output is. The two strings below
-      // are the shapes that serialization takes: the own enumerable fields, and a
-      // full inspection that also covers the stack and the cause chain. Neither
-      // may name a path, so the raw failure is not carried as a cause either.
-      expect(escaping.cause).toBeUndefined();
-
-      const audited = `${JSON.stringify(escaping)}${inspect(escaping, {
-        depth: Infinity,
-      })}`;
-
-      expect(audited).not.toContain(callerPath);
-      expect(audited).not.toContain(resolvePath(workspacePath, callerPath));
-      expect(audited).not.toContain(workspacePath);
-
-      // The failure is reported exactly once, with the same path-free text as the
-      // escaping error and with no second argument: handing the native error to
-      // the logger would reinstate the resolved path through its message and its
-      // enumerable `path` field.
-      expect(errorLog).toHaveBeenCalledTimes(1);
-      expect(errorLog).toHaveBeenCalledWith(escaping.message);
-
-      errorLog.mockRestore();
-    }
-  });
-
-  it('should keep control characters and paths out of every log message', async () => {
-    // A file name may legitimately contain carriage returns, line feeds and
-    // terminal escape sequences, none of which the task logger's secret redaction
-    // neutralizes. Interpolating one into a log message would let a template forge
-    // multiline log records or rewrite terminal output, so every branch that logs
-    // has to name the entry by its index instead of by its path.
-    const controlName = 'control\r\n\u001b[31m\u0007name.txt';
-    const seededControlDir = `dir-${controlName}`;
-
-    mockDir.setContent({
-      [workspacePath]: {
-        'unit-test-a.js': 'hello',
-        [`file-${controlName}`]: 'seeded',
-        [seededControlDir]: { 'file.md': 'content' },
-      },
-    });
-
-    const infoLog = jest.spyOn(mockContext.logger, 'info');
-    const warnLog = jest.spyOn(mockContext.logger, 'warn');
-    const errorLog = jest.spyOn(mockContext.logger, 'error');
-
-    const loggedMessages = () =>
-      [infoLog, warnLog, errorLog].flatMap(spy =>
-        spy.mock.calls.map(call => call.join(' ')),
-      );
-
-    const expectControlSafe = (callerPath: string) => {
-      const messages = loggedMessages();
-
-      expect(messages).not.toEqual([]);
-
-      for (const message of messages) {
-        // No C0 or C1 control character, so a single log record cannot be split
-        // into several or carry a terminal escape sequence.
-        // eslint-disable-next-line no-control-regex
-        expect(message).not.toMatch(/[\u0000-\u001f\u007f-\u009f]/);
-
-        // Neither the caller's path nor anything it resolves to is disclosed, so
-        // a rendered secret cannot reach a log record through a file name and the
-        // layout of the workspace stays private.
-        expect(message).not.toContain(controlName);
-        expect(message).not.toContain(callerPath);
-        expect(message).not.toContain(workspacePath);
-      }
-    };
-
-    const clearLogs = () => {
-      infoLog.mockClear();
-      warnLog.mockClear();
-      errorLog.mockClear();
-    };
-
-    // The success branch: the file is created, so the `info` line is emitted.
-    const created = `created-${controlName}`;
+    // The skip is the branch that emits the `warn` line, and a dry run is no
+    // reason to name a caller's path in it, so this repeats the skip for a
+    // missing target whose name carries control characters.
+    const controlMissing = `missing-${controlName}`;
+    const spies = spyOnLogs();
 
     await action.handler({
-      ...mockContext,
-      input: { files: [{ path: created, content: 'x' }] },
-    });
-
-    expect(fs.existsSync(resolvePath(workspacePath, created))).toBe(true);
-    expect(infoLog).toHaveBeenCalledWith(
-      'Content appended to the file at index 0 of the files input successfully',
-    );
-    expectControlSafe(created);
-    clearLogs();
-
-    // The dry-run branch: a missing strict target is skipped with a `warn` line.
-    const missing = `missing-${controlName}`;
-
-    await action.handler({
-      ...mockContext,
-      isDryRun: true,
+      ...dryRunContext,
       input: {
-        files: [{ path: missing, content: 'x', createIfMissing: false }],
+        files: [{ path: controlMissing, content: 'x', createIfMissing: false }],
       },
     });
 
-    expect(fs.existsSync(resolvePath(workspacePath, missing))).toBe(false);
-    expect(warnLog).toHaveBeenCalledWith(
+    expect(fs.existsSync(resolvePath(workspacePath, controlMissing))).toBe(
+      false,
+    );
+    expect(spies.warn).toHaveBeenCalledWith(
       'Skipped the file at index 0 of the files input during a dry run, it does not exist and createIfMissing is false',
     );
-    expectControlSafe(missing);
-    clearLogs();
-
-    // The filesystem-failure branch: appending to a directory fails with EISDIR
-    // after the path has resolved.
-    await expect(
-      action.handler({
-        ...mockContext,
-        input: { files: [{ path: seededControlDir, content: 'x' }] },
-      }),
-    ).rejects.toThrow(
-      'Failed to append content to the file at index 0 of the files input (EISDIR)',
-    );
-
-    expectControlSafe(seededControlDir);
-    clearLogs();
-
-    // The resolver-failure branch: a regular file cannot contain a directory, so
-    // resolution itself fails with ENOTDIR before any write is attempted.
-    const underFile = `file-${controlName}/nested/child.txt`;
-
-    await expect(
-      action.handler({
-        ...mockContext,
-        input: { files: [{ path: underFile, content: 'x' }] },
-      }),
-    ).rejects.toThrow(
-      'Failed to append content to the file at index 0 of the files input (ENOTDIR)',
-    );
-
-    expectControlSafe(underFile);
+    expectLogsSafe(spies, controlMissing);
   });
 });
