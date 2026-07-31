@@ -16,7 +16,11 @@
 
 import { createTemplateAction } from '@backstage/plugin-scaffolder-node';
 import { InputError, isError, NotAllowedError } from '@backstage/errors';
-import { resolveSafeChildPath } from '@backstage/backend-plugin-api';
+import {
+  LoggerService,
+  resolveSafeChildPath,
+} from '@backstage/backend-plugin-api';
+import { isAbsolute } from 'node:path';
 import fs from 'fs-extra';
 import { examples } from './append.examples';
 
@@ -35,11 +39,30 @@ const pathExistsOrThrow = async (filepath: string): Promise<boolean> => {
   }
 };
 
-// Strips caller derived path information out of an error before it leaves the
-// handler, naming the offending entry by its index in the files input instead.
-// Paths are step input rendered with task and environment secrets in scope, and
-// an escaping error is audited from its own fields, its stack and its cause
-// chain, none of which pass the secret redaction that ctx.logger output does.
+// An errno such as ENOTDIR or EACCES is the single most useful part of a native
+// filesystem failure, and unlike the rest of the failure it is never caller
+// derived. Only a value matching this shape is carried into a message, which
+// keeps the allow list narrow enough that no control character, path fragment or
+// other unexpected text can reach a log record or an escaping error through it.
+const asErrnoCode = (err: unknown): string | undefined => {
+  if (!isError(err) || typeof err.code !== 'string') {
+    return undefined;
+  }
+  return /^[A-Z][A-Z0-9_]*$/.test(err.code) ? err.code : undefined;
+};
+
+// Builds the failure that leaves the handler, and the single message that is
+// logged for it, out of nothing but the entry's index in the files input and an
+// allow listed errno.
+//
+// Neither the caller supplied path nor the path it resolves to is ever included.
+// A path is step input rendered with task and environment secrets in scope, and
+// a valid POSIX filename may contain carriage returns, line feeds or terminal
+// escape sequences, so repeating one would risk forging log records and
+// disclosing secrets or the layout of the workspace. An escaping error is
+// audited from its own fields, its stack and its cause chain, none of which pass
+// the secret redaction that ctx.logger output does. The entry's index is enough
+// to identify it, because the caller authored the files input it indexes.
 const withoutPathDetail = (err: unknown, index: number): Error => {
   // Raised below with a deliberately path free message, so it already carries
   // nothing caller derived and is returned as it is. That also keeps the
@@ -48,21 +71,31 @@ const withoutPathDetail = (err: unknown, index: number): Error => {
     return err;
   }
 
-  // A filesystem error code such as ENOTDIR or EACCES is the single most useful
-  // part of a native failure and is never caller derived, so it is the one
-  // detail that is carried over into the replacement message.
-  const code =
-    isError(err) && typeof err.code === 'string' ? ` (${err.code})` : '';
+  const code = asErrnoCode(err);
 
-  // The original error is deliberately not attached as a cause. A native
-  // filesystem failure repeats the resolved path in its own message and in
-  // enumerable fields such as path and dest, and error serialization follows the
-  // cause chain, so a raw cause would put back exactly what the replacement
-  // message leaves out. The untouched error is reported through ctx.logger at
-  // each throw site instead, where secret redaction runs first.
+  // The original error is deliberately neither attached as a cause nor handed to
+  // the logger. A native filesystem failure repeats the resolved path in its own
+  // message and in enumerable fields such as path and dest, and error
+  // serialization follows the cause chain, so either would put back exactly what
+  // the replacement message leaves out.
   return new Error(
-    `Failed to append content to the file at index ${index} of the files input${code}, see the step log for the resolved path`,
+    `Failed to append content to the file at index ${index} of the files input${
+      code ? ` (${code})` : ''
+    }`,
   );
+};
+
+// Reports a failure through the step logger and returns the error to throw for
+// it. Both carry exactly the same path free text, so the log record cannot
+// disclose a detail that the escaping error withholds, or the other way around.
+const logFailure = (
+  logger: LoggerService,
+  err: unknown,
+  index: number,
+): Error => {
+  const failure = withoutPathDetail(err, index);
+  logger.error(failure.message);
+  return failure;
 };
 
 /**
@@ -120,6 +153,21 @@ export const createFilesystemAppendAction = () => {
           );
         }
 
+        // The documented input contract is a workspace-relative path, and this is
+        // where that contract is enforced. resolveSafeChildPath on its own does
+        // not enforce it: it accepts an absolute path whenever the path happens
+        // to resolve inside the workspace, which would both widen the accepted
+        // input beyond what the schema declares and couple templates to the
+        // internal layout of the per-run workspace directory. The check runs
+        // before the resolution below so that no absolute path reaches the
+        // filesystem, and its message names the entry by its index rather than by
+        // its path, which is caller derived.
+        if (isAbsolute(file.path)) {
+          throw new InputError(
+            `the path of the file at index ${index} of the files input must be workspace-relative`,
+          );
+        }
+
         // Resolved before the try block below, so the NotAllowedError raised for a
         // path that points outside of the workspace always propagates untouched,
         // and is never downgraded or suppressed by the dry run handling. Its
@@ -132,11 +180,7 @@ export const createFilesystemAppendAction = () => {
           if (err instanceof NotAllowedError) {
             throw err;
           }
-          ctx.logger.error(
-            `Failed to resolve the path of file ${file.path}:`,
-            err,
-          );
-          throw withoutPathDetail(err, index);
+          throw logFailure(ctx.logger, err, index);
         }
 
         // The fallback is applied here rather than in the schema above, because the
@@ -157,28 +201,22 @@ export const createFilesystemAppendAction = () => {
             // A dry run must not fail purely because a target does not exist yet, so
             // this entry is skipped and the remaining ones are still processed.
             ctx.logger.warn(
-              `Skipped appending to file ${filepath} during a dry run, the file does not exist and createIfMissing is false`,
+              `Skipped the file at index ${index} of the files input during a dry run, it does not exist and createIfMissing is false`,
             );
             continue;
           } else {
-            // The resolved path is deliberately left out of this message because
-            // the error escapes the handler, see withoutPathDetail above. The
-            // catch below reports the path through ctx.logger instead.
+            // Named by its index like every other message this action emits: this
+            // error escapes the handler, and the path is caller derived.
             throw new InputError(
               `Cannot append to the file at index ${index} of the files input because it does not exist and createIfMissing is false`,
             );
           }
 
-          ctx.logger.info(`Content appended to file ${filepath} successfully`);
-        } catch (err) {
-          // On failure the resolved path is reported through ctx.logger, whose
-          // secret redaction runs before anything is persisted; the rethrown
-          // error is stripped of it.
-          ctx.logger.error(
-            `Failed to append content to file ${filepath}:`,
-            err,
+          ctx.logger.info(
+            `Content appended to the file at index ${index} of the files input successfully`,
           );
-          throw withoutPathDetail(err, index);
+        } catch (err) {
+          throw logFailure(ctx.logger, err, index);
         }
       }
     },
