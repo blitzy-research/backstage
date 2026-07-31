@@ -28,20 +28,33 @@ type AppendFile = {
   createIfMissing?: boolean;
 };
 
+// The shape of a complete published step, so that each example is parsed in full
+// rather than reaching straight for its input. `.nonempty()` infers a non-empty
+// tuple, so annotate the parsed YAML to keep handler inputs type-safe.
+type AppendStep = {
+  action: string;
+  id: string;
+  name: string;
+  input: { files: [AppendFile, ...AppendFile[]] };
+};
+
 describe('fs:append examples', () => {
   const action = createFilesystemAppendAction();
 
-  // `.nonempty()` infers a non-empty tuple; annotate parsed YAML so handler
-  // inputs remain type-safe.
-  const appendToExisting: [AppendFile, ...AppendFile[]] = yaml.parse(
-    examples[0].example,
-  ).steps[0].input.files;
-  const createMissing: [AppendFile, ...AppendFile[]] = yaml.parse(
-    examples[1].example,
-  ).steps[0].input.files;
-  const strictAppend: [AppendFile, ...AppendFile[]] = yaml.parse(
-    examples[2].example,
-  ).steps[0].input.files;
+  // Every example is parsed as a whole step, so a snippet that names another
+  // action or nests its input differently is caught by the assertions in each
+  // case below instead of quietly documenting behaviour that is never executed.
+  const appendToExistingStep: AppendStep = yaml.parse(examples[0].example)
+    .steps[0];
+  const createMissingStep: AppendStep = yaml.parse(examples[1].example)
+    .steps[0];
+  const strictAppendStep: AppendStep = yaml.parse(examples[2].example).steps[0];
+
+  // The handler is driven with the input of the parsed step, never with a
+  // hand-written copy of it.
+  const appendToExisting = appendToExistingStep.input.files;
+  const createMissing = createMissingStep.input.files;
+  const strictAppend = strictAppendStep.input.files;
 
   const mockDir = createMockDirectory();
   const workspacePath = resolvePath(mockDir.path, 'workspace');
@@ -65,6 +78,14 @@ describe('fs:append examples', () => {
   });
 
   it('should append content to files that already exist', async () => {
+    // The examples only reach template authors once the factory publishes them,
+    // and the count is pinned here so a fourth example cannot ship without a
+    // case of its own in this suite.
+    expect(action.examples).toEqual(examples);
+    expect(action.examples).toHaveLength(3);
+
+    expect(appendToExistingStep.action).toEqual('fs:append');
+
     // Keep the batch aligned with the two seeded files so this case cannot fall
     // through to create-if-missing.
     expect(appendToExisting).toHaveLength(2);
@@ -92,6 +113,7 @@ describe('fs:append examples', () => {
   });
 
   it('should create the file and its parent directories when it does not exist', async () => {
+    expect(createMissingStep.action).toEqual('fs:append');
     expect(createMissing[0].createIfMissing).toBe(true);
 
     const target = resolvePath(workspacePath, createMissing[0].path);
@@ -122,6 +144,7 @@ describe('fs:append examples', () => {
   });
 
   it('should append only to a file that already exists', async () => {
+    expect(strictAppendStep.action).toEqual('fs:append');
     expect(strictAppend[0].createIfMissing).toBe(false);
     expect(strictAppend[0].path).toEqual(appendToExisting[0].path);
 

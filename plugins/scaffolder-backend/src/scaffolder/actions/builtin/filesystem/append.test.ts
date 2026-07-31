@@ -18,7 +18,7 @@ import { resolve as resolvePath } from 'node:path';
 import { createFilesystemAppendAction } from './append';
 import { createFilesystemAppendAction as createFromBarrel } from './index';
 import { createMockActionContext } from '@backstage/plugin-scaffolder-node-test-utils';
-import { InputError } from '@backstage/errors';
+import { InputError, NotAllowedError } from '@backstage/errors';
 import fs from 'fs-extra';
 import { createMockDirectory } from '@backstage/backend-test-utils';
 
@@ -136,53 +136,66 @@ describe('fs:append', () => {
   });
 
   it('should throw when the path is not relative to the workspace', async () => {
-    await expect(
-      action.handler({
-        ...mockContext,
-        input: { files: [{ path: '../../etc/x', content: 'x' }] },
-      }),
-    ).rejects.toThrow(
+    // The error class is asserted alongside the message: a path escape must stay
+    // the `NotAllowedError` that `resolveSafeChildPath` raises, so an
+    // implementation that caught it and rethrew a plain `Error` carrying the same
+    // text cannot satisfy this case.
+    const relativeEscape = action.handler({
+      ...mockContext,
+      input: { files: [{ path: '../../etc/x', content: 'x' }] },
+    });
+
+    await expect(relativeEscape).rejects.toThrow(NotAllowedError);
+    await expect(relativeEscape).rejects.toThrow(
       /Relative path is not allowed to refer to a directory outside its parent/,
     );
 
-    await expect(
-      action.handler({
-        ...mockContext,
-        input: { files: [{ path: '/foo/../../../index.js', content: 'x' }] },
-      }),
-    ).rejects.toThrow(
+    const absoluteEscape = action.handler({
+      ...mockContext,
+      input: { files: [{ path: '/foo/../../../index.js', content: 'x' }] },
+    });
+
+    await expect(absoluteEscape).rejects.toThrow(NotAllowedError);
+    await expect(absoluteEscape).rejects.toThrow(
       /Relative path is not allowed to refer to a directory outside its parent/,
     );
   });
 
   it('should throw an error when files is not an array', async () => {
-    await expect(
-      action.handler({
-        ...mockContext,
-        input: { files: undefined } as any,
-      }),
-    ).rejects.toThrow(/files must be an Array/);
+    // Each value asserts the error class as well as the message, so a guard that
+    // stopped raising `InputError` and threw a plain `Error` with the same text
+    // would fail here rather than pass unnoticed.
+    const undefinedFiles = action.handler({
+      ...mockContext,
+      input: { files: undefined } as any,
+    });
 
-    await expect(
-      action.handler({
-        ...mockContext,
-        input: { files: {} } as any,
-      }),
-    ).rejects.toThrow(/files must be an Array/);
+    await expect(undefinedFiles).rejects.toThrow(InputError);
+    await expect(undefinedFiles).rejects.toThrow(/files must be an Array/);
 
-    await expect(
-      action.handler({
-        ...mockContext,
-        input: { files: '' } as any,
-      }),
-    ).rejects.toThrow(/files must be an Array/);
+    const objectFiles = action.handler({
+      ...mockContext,
+      input: { files: {} } as any,
+    });
 
-    await expect(
-      action.handler({
-        ...mockContext,
-        input: { files: null } as any,
-      }),
-    ).rejects.toThrow(/files must be an Array/);
+    await expect(objectFiles).rejects.toThrow(InputError);
+    await expect(objectFiles).rejects.toThrow(/files must be an Array/);
+
+    const stringFiles = action.handler({
+      ...mockContext,
+      input: { files: '' } as any,
+    });
+
+    await expect(stringFiles).rejects.toThrow(InputError);
+    await expect(stringFiles).rejects.toThrow(/files must be an Array/);
+
+    const nullFiles = action.handler({
+      ...mockContext,
+      input: { files: null } as any,
+    });
+
+    await expect(nullFiles).rejects.toThrow(InputError);
+    await expect(nullFiles).rejects.toThrow(/files must be an Array/);
   });
 
   it('should throw an error when a file entry is missing path or content', async () => {
@@ -307,8 +320,14 @@ describe('fs:append', () => {
 
   it('should not throw for a missing file during a dry run', async () => {
     const target = resolvePath(workspacePath, 'missing-in-dry-run.txt');
+    const laterTarget = resolvePath(workspacePath, 'unit-test-b.js');
+
+    // `ctx.isDryRun` is only ever true for an action that advertises dry run
+    // support, so the leniency asserted below is unreachable without this flag.
+    expect(action.supportsDryRun).toBe(true);
 
     expect(fs.existsSync(target)).toBe(false);
+    expect(await fs.readFile(laterTarget, 'utf-8')).toEqual('world');
 
     // The dry run flag is spread onto the context rather than passed to
     // `createMockActionContext`, which propagates only a fixed set of options
@@ -324,11 +343,30 @@ describe('fs:append', () => {
               content: 'x',
               createIfMissing: false,
             },
+            // Deliberately ordered after the skipped entry: the handler must
+            // continue to the remaining entries, so a regression that returned
+            // early instead of continuing would leave this file untouched.
+            { path: 'unit-test-b.js', content: '-dry' },
           ],
         },
       }),
     ).resolves.not.toThrow();
 
     expect(fs.existsSync(target)).toBe(false);
+    expect(await fs.readFile(laterTarget, 'utf-8')).toEqual('world-dry');
+
+    // A dry run never relaxes path safety: the leniency above is scoped to a
+    // missing target, and an escaping path still fails with the untouched
+    // `NotAllowedError` from `resolveSafeChildPath`.
+    const escapingInDryRun = action.handler({
+      ...mockContext,
+      isDryRun: true,
+      input: { files: [{ path: '../../etc/x', content: 'x' }] },
+    });
+
+    await expect(escapingInDryRun).rejects.toThrow(NotAllowedError);
+    await expect(escapingInDryRun).rejects.toThrow(
+      /Relative path is not allowed to refer to a directory outside its parent/,
+    );
   });
 });
