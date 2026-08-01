@@ -17,3 +17,4 @@
 export { createFilesystemDeleteAction } from './delete';
 export { createFilesystemRenameAction } from './rename';
 export { createFilesystemReadDirAction } from './read';
+export { createFilesystemAppendAction } from './append';

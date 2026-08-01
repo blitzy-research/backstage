@@ -182,6 +182,28 @@ export function createFetchTemplateFileAction(options: {
 >;
 
 // @public
+export const createFilesystemAppendAction: () => TemplateAction<
+  {
+    files: [
+      {
+        content: string;
+        path: string;
+        createIfMissing?: boolean | undefined;
+      },
+      ...{
+        content: string;
+        path: string;
+        createIfMissing?: boolean | undefined;
+      }[],
+    ];
+  },
+  {
+    [x: string]: any;
+  },
+  'v2'
+>;
+
+// @public
 export const createFilesystemDeleteAction: () => TemplateAction<
   {
     files: string[];
